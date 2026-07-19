@@ -156,7 +156,13 @@ def read_ci(path):
         t=' '.join(str(v) for v in raw.iloc[i] if pd.notna(v))
         m=re.search(r'Currency[:\s]+([A-Z]{3})',t)
         if m: doviz=m.group(1);break
-    return pd.DataFrame(rows), doviz
+    df=pd.DataFrame(rows)
+    nums=df['ci_satir'].astype(int).tolist() if not df.empty else []
+    gaps=[]
+    if nums:
+        gaps=sorted(set(range(min(nums),max(nums)+1))-set(nums))
+    df.attrs['sira_bosluklari']=gaps
+    return df, doviz
 
 # ════════════════════ PL OKUMA ════════════════════
 def read_pl(path):
@@ -172,8 +178,11 @@ def read_pl(path):
         for j,h in enumerate(hdr):
             if any(k in h for k in keys): return j
         return None
+    c_no=col(['carton no','item','satır','sira','sıra'])
     c_desc=col(['description','ürün','goods']); c_qty=col(['total qty','quantity','qty','adet','pcs'])
+    c_ctn=col(['ctn qty','carton qty','koli adedi','koli qty'])
     c_net=col(['n.w','net']); c_gross=col(['g.w','gross','brüt','brut'])
+    c_cbm=col(['volume','cbm','hacim'])
     rows=[]; last=None; ln=0
     for i in range(hr+1,len(raw)):
         r=raw.iloc[i]
@@ -186,9 +195,14 @@ def read_pl(path):
         if d: last=d
         else: d=last
         ln+=1
-        rows.append(dict(pl_satir=ln, urun=d, adet_pl=qty,
+        pl_no=r[c_no] if c_no is not None and pd.notna(r[c_no]) else ln
+        try: pl_no=int(float(pl_no))
+        except (TypeError,ValueError): pl_no=ln
+        rows.append(dict(pl_satir=pl_no, urun=d, adet_pl=qty,
+            koli_adedi=r[c_ctn] if c_ctn is not None else None,
             net_kg=r[c_net] if c_net is not None else None,
-            brut_kg=r[c_gross] if c_gross is not None else None))
+            brut_kg=r[c_gross] if c_gross is not None else None,
+            cbm=r[c_cbm] if c_cbm is not None else None))
     return pd.DataFrame(rows)
 
 # ════════════════════ ÖĞRENME OKUMA ════════════════════
@@ -234,6 +248,7 @@ def archive_check(ref, urun, gtip_ci):
 # ════════════════════ ANA İŞLEM ════════════════════
 def process(ci_path, pl_path, dosya, tedarikci=None, mense=None):
     ci, doviz = read_ci(ci_path)
+    ci_gaps=ci.attrs.get('sira_bosluklari',[])
     pl = read_pl(pl_path)
     ref = load_ref()
     learned = load_learned()
@@ -259,22 +274,26 @@ def process(ci_path, pl_path, dosya, tedarikci=None, mense=None):
             if m: gtip=m.group(1); kaynak_gtip='ARŞİV'
         tr_tanim = L['Türkçe Tanım'] if L else ''
         kdv = L['KDV %'] if L else ''
-        row=dict(ci_satir=c['ci_satir'], urun=c['urun'], model=c['model'],
+        row=dict(ci_satir=c['ci_satir'], urun=c['urun'], pl_urun='', model=c['model'],
                  gtip=gtip, gtip_kaynak=kaynak_gtip, tur='Bedelli',
                  adet_ci=c['adet_ci'], birim_fiyat=c['birim_fiyat'], kiymet_usd=c['kiymet_usd'],
                  tr_tanim=tr_tanim, kdv=kdv)
         if len(cand)>0:
             p=cand.iloc[0]; pl_pool=pl_pool.drop(p.name)
-            row.update(pl_satir=p['pl_satir'], adet_pl=p['adet_pl'],
+            row.update(pl_satir=p['pl_satir'], pl_urun=p['urun'], adet_pl=p['adet_pl'],
+                       koli_adedi=p['koli_adedi'], cbm=p['cbm'],
                        net_kg=p['net_kg'], brut_kg=p['brut_kg'],
                        adet_durum='OK' if c['adet_ci']==p['adet_pl'] else 'FARK',
                        isim_durum='OK' if c['urun']==p['urun'] else 'FARK')
         else:
-            row.update(pl_satir=None, adet_pl=None, net_kg=None, brut_kg=None,
+            row.update(pl_satir=None, pl_urun='', adet_pl=None, koli_adedi=None, cbm=None,
+                       net_kg=None, brut_kg=None,
                        adet_durum='PL YOK', isim_durum='-')
         row['arsiv']=archive_check(ref,c['urun'],gtip)
         detay.append(row)
     D=pd.DataFrame(detay)
+    D.attrs['ci_sira_bosluklari']=ci_gaps
+    D.attrs['eslesmeyen_pl']=pl_pool.to_dict('records')
     return D, doviz, tedarikci, ref, learned
 
 # ════════════════════ EXCEL ÜRET ════════════════════
@@ -296,13 +315,14 @@ def build_excel(D, doviz, dosya, tedarikci):
 
     # S1 Detay
     ws=wb.active;ws.title="Detay_Eslestirme"
-    cols=['CI Satır','PL Satır','GTİP','GTİP Kaynağı','Ürün','Türkçe Tanım','Tür','Adet CI','Adet PL',
-          'Birim Fiyat','Kıymet USD','Net Kilo','Brüt Kilo','KDV %','Adet Durumu','İsim Durumu','Arşiv Kontrol']
+    cols=['CI Satır','PL Satır','GTİP','GTİP Kaynağı','CI Ürün','PL Ürün','Türkçe Tanım','Tür',
+          'Adet CI','Adet PL','Koli Adedi','Birim Fiyat','Kıymet USD','Net Kilo','Brüt Kilo','CBM',
+          'KDV %','Adet Durumu','İsim Durumu','Arşiv Kontrol']
     ws.append(cols)
     for _,r in D.iterrows():
         ws.append([r['ci_satir'],r['pl_satir'],dot_gtip(r['gtip']) if r['gtip'] else '',
-            r['gtip_kaynak'],r['urun'],r['tr_tanim'],r['tur'],r['adet_ci'],r['adet_pl'],
-            r['birim_fiyat'],r['kiymet_usd'],r['net_kg'],r['brut_kg'],r['kdv'],
+            r['gtip_kaynak'],r['urun'],r['pl_urun'],r['tr_tanim'],r['tur'],r['adet_ci'],r['adet_pl'],
+            r['koli_adedi'],r['birim_fiyat'],r['kiymet_usd'],r['net_kg'],r['brut_kg'],r['cbm'],r['kdv'],
             r['adet_durum'],r['isim_durum'],r['arsiv']])
     hdr(ws,len(cols))
     ia=cols.index('Adet Durumu')+1;ii=cols.index('İsim Durumu')+1;iar=cols.index('Arşiv Kontrol')+1
@@ -310,14 +330,14 @@ def build_excel(D, doviz, dosya, tedarikci):
     for i in range(2,ws.max_row+1):
         for j in range(1,len(cols)+1):
             c=ws.cell(i,j);c.border=BD;c.font=AR
-            c.alignment=Alignment(vertical="center",wrap_text=(cols[j-1] in('Ürün','Türkçe Tanım','Arşiv Kontrol')))
+            c.alignment=Alignment(vertical="center",wrap_text=(cols[j-1] in('CI Ürün','PL Ürün','Türkçe Tanım','Arşiv Kontrol')))
         for ci_ in (ia,ii):
             ws.cell(i,ci_).fill = OK if ws.cell(i,ci_).value=='OK' else WARN
         av=str(ws.cell(i,iar).value)
         ws.cell(i,iar).fill = OK if 'TUTUYOR' in av else (DIK if 'DİKKAT' in av else PatternFill())
         gk=str(ws.cell(i,ig).value)
         ws.cell(i,ig).fill = OK if gk in('CI','ÖĞRENİLMİŞ') else (DIK if gk in('ARŞİV',) else WARN if gk=='' else PatternFill())
-    for j,w in enumerate([7,7,17,12,24,22,8,9,9,10,11,9,9,7,11,11,20],1):
+    for j,w in enumerate([7,7,17,12,23,23,22,8,9,9,10,10,11,9,9,8,7,11,11,20],1):
         ws.column_dimensions[get_column_letter(j)].width=w
 
     # S2 Özet
@@ -326,23 +346,24 @@ def build_excel(D, doviz, dosya, tedarikci):
     Dg['gtip']=Dg['gtip'].astype(str)
     grp=Dg.groupby(['gtip','tur']).agg(
         ds=('ci_satir','count'),ad=('adet_ci','sum'),ky=('kiymet_usd','sum'),
-        nk=('net_kg','sum'),bk=('brut_kg','sum'),
+        nk=('net_kg','sum'),bk=('brut_kg','sum'),ctn=('koli_adedi','sum'),cbm=('cbm','sum'),
         ur=('urun',lambda x:' / '.join(sorted(set(x)))),
         tr=('tr_tanim',lambda x:next((v for v in x if v),''))).reset_index()
-    oc=['GTİP','Türkçe Tanım','Tür','Ürün İsimleri','Detay Satır','Adet','Kıymet USD','Net Kilo','Brüt Kilo']
+    oc=['GTİP','Türkçe Tanım','Tür','Ürün İsimleri','Detay Satır','Adet','Koli Adedi',
+        'Kıymet USD','Net Kilo','Brüt Kilo','CBM']
     ws2.append(oc)
     for _,r in grp.iterrows():
         ws2.append([dot_gtip(r['gtip']),r['tr'],r['tur'],r['ur'],int(r['ds']),
-            r['ad'],round(r['ky'],2),round(r['nk'],2),round(r['bk'],3)])
+            r['ad'],r['ctn'],round(r['ky'],2),round(r['nk'],2),round(r['bk'],3),round(r['cbm'],3)])
     tr=ws2.max_row+1;ws2.cell(tr,1,'TOPLAM')
-    for col_l in ['E','F','G','H','I']: ws2.cell(tr,ord(col_l)-64,f"=SUM({col_l}2:{col_l}{tr-1})")
+    for col_l in ['E','F','G','H','I','J','K']: ws2.cell(tr,ord(col_l)-64,f"=SUM({col_l}2:{col_l}{tr-1})")
     hdr(ws2,len(oc))
     for i in range(2,ws2.max_row+1):
         for j in range(1,len(oc)+1):
             c=ws2.cell(i,j);c.border=BD;c.font=ARB if i==tr else AR
             c.alignment=Alignment(vertical="center",wrap_text=(oc[j-1] in('Ürün İsimleri','Türkçe Tanım')))
             if i==tr:c.fill=HDRB
-    for j,w in enumerate([17,22,8,40,10,11,12,10,10],1):
+    for j,w in enumerate([17,22,8,40,10,11,10,12,10,10,9],1):
         ws2.column_dimensions[get_column_letter(j)].width=w
 
     # S3 Kontrol
@@ -351,7 +372,12 @@ def build_excel(D, doviz, dosya, tedarikci):
     oz_ky=grp['ky'].sum();oz_nk=grp['nk'].sum();oz_bk=grp['bk'].sum()
     isimf=(D['isim_durum']=='FARK').sum();adetf=(D['adet_durum']!='OK').sum()
     dik=(D['arsiv'].astype(str).str.contains('DİKKAT')).sum()
+    arsivyok=(D['arsiv'].astype(str).str.contains('arşivde yok|arşiv yok',case=False,regex=True)).sum()
     nogtip=(D['gtip'].isna()|(D['gtip']=='')).sum()
+    notr=(D['tr_tanim'].isna()|(D['tr_tanim']=='')).sum()
+    nokdv=(D['kdv'].isna()|(D['kdv']=='')).sum()
+    ci_gaps=D.attrs.get('ci_sira_bosluklari',[])
+    eslesmeyen_pl=len(D.attrs.get('eslesmeyen_pl',[]))
     K=[('Kontrol Kalemi','Değer','Durum'),
        ('CI Toplam Adet',f"{ci_ad:,.0f}",''),('PL Toplam Adet',f"{pl_ad:,.0f}",''),
        ('Adet Farkı',f"{ci_ad-pl_ad:,.0f}",'OK' if ci_ad==pl_ad else 'HATA'),
@@ -362,8 +388,13 @@ def build_excel(D, doviz, dosya, tedarikci):
        ('— HATA YAKALAMA —','',''),
        ('İsim Farkı Olan Satır',f"{isimf}",'OK' if isimf==0 else 'İNCELE'),
        ('Adet Uyuşmayan Satır',f"{adetf}",'OK' if adetf==0 else 'İNCELE'),
+       ('CI Sıra No Boşluğu',', '.join(map(str,ci_gaps)) if ci_gaps else '0','OK' if not ci_gaps else 'İNCELE'),
+       ('Eşleşmeyen PL Satırı',f"{eslesmeyen_pl}",'OK' if eslesmeyen_pl==0 else 'HATA'),
        ('GTİP Boş Kalem',f"{nogtip}",'OK' if nogtip==0 else 'İNCELE'),
-       ('Arşiv GTİP Uyuşmazlığı',f"{dik}",'OK' if dik==0 else 'İNCELE')]
+       ('Arşiv GTİP Uyuşmazlığı',f"{dik}",'OK' if dik==0 else 'İNCELE'),
+       ('Arşivde Bulunmayan Kalem',f"{arsivyok}",'OK' if arsivyok==0 else 'İNCELE'),
+       ('Türkçe Tanımı Boş Kalem',f"{notr}",'OK' if notr==0 else 'İNCELE'),
+       ('KDV Oranı Boş Kalem',f"{nokdv}",'OK' if nokdv==0 else 'İNCELE')]
     for row in K: ws3.append(row)
     hdr(ws3,3)
     for i in range(2,ws3.max_row+1):
@@ -401,10 +432,11 @@ def build_excel(D, doviz, dosya, tedarikci):
     for j,w in enumerate([24,18,38,12],1):ws4.column_dimensions[get_column_letter(j)].width=w
 
     os.makedirs(CIKTI_DIR,exist_ok=True)
-    out=os.path.join(CIKTI_DIR,f"{dosya}_HAZIRLIK.xlsx")
+    out=guvenli_yol(CIKTI_DIR,f"{dosya}_HAZIRLIK")
     wb.save(out)
     return out, dict(isim_fark=isimf,adet_fark=adetf,nogtip=nogtip,dikkat=dik,
-                     kiymet_ok=abs(ci_ky-oz_ky)<0.01)
+                     arsiv_yok=arsivyok,turkce_bos=notr,kdv_bos=nokdv,ci_sira_bosluk=ci_gaps,
+                     eslesmeyen_pl=eslesmeyen_pl,kiymet_ok=abs(ci_ky-oz_ky)<0.01)
 
 # ════════════════════ ÖĞRENME İŞLE ════════════════════
 def learn(D, tedarikci, dosya, mense='', kdv='', olcu='ADET'):
@@ -473,6 +505,8 @@ def main():
     ap.add_argument('--mense', default=None, help='Menşe kodu (otomatik/varsayılan 720)')
     ap.add_argument('--dosya', default=None, help='Çıktı adı (otomatik: FIRMA_FATURANO)')
     ap.add_argument('--onayla', action='store_true', help='Onayla ve öğren + tamamlanana taşı')
+    ap.add_argument('--inceledim', action='store_true',
+                    help='Uyarıları gördüğünü ve manuel kontrol ettiğini teyit eder; --onayla ile birlikte kullanılır')
     a=ap.parse_args()
 
     GELEN=os.path.join(BASE,'gelen'); TAMAM=os.path.join(BASE,'tamamlanan')
@@ -511,16 +545,19 @@ def main():
     print(f"  CI+PL eşleşti: {len(D)} kalem | döviz {doviz}")
 
     out,ozet=build_excel(D,doviz,dosya,ted)
-    # çakışma koruması: build_excel sabit isim yazdı, güvenli isme taşı
-    hedef=guvenli_yol(CIKTI_DIR, f"{dosya}_HAZIRLIK")
-    if os.path.abspath(out)!=os.path.abspath(hedef):
-        os.replace(out,hedef); out=hedef
     print(f"  Çıktı: {out}")
     print(f"  Hata yakalama: isim farkı={ozet['isim_fark']}, adet fark={ozet['adet_fark']}, "
-          f"GTİP boş={ozet['nogtip']}, arşiv uyuşmazlık={ozet['dikkat']}, "
+          f"GTİP boş={ozet['nogtip']}, arşiv uyuşmazlık={ozet['dikkat']}, arşivde yok={ozet['arsiv_yok']}, "
           f"kıymet mutabakat={'OK' if ozet['kiymet_ok'] else 'HATA'}")
 
     if a.onayla:
+        kritik=(ozet['adet_fark']>0 or ozet['nogtip']>0 or ozet['eslesmeyen_pl']>0 or not ozet['kiymet_ok'])
+        uyarili=(ozet['isim_fark']>0 or bool(ozet['ci_sira_bosluk']) or ozet['dikkat']>0 or
+                 ozet['arsiv_yok']>0 or ozet['turkce_bos']>0 or ozet['kdv_bos']>0)
+        if kritik:
+            raise SystemExit("ONAY ENGELLENDİ: Adet/kıymet/GTİP veya PL eşleşmesinde kritik hata var. Kontrol sayfasını düzeltin.")
+        if uyarili and not a.inceledim:
+            raise SystemExit("ONAY BEKLİYOR: İnceleme uyarıları var. Kontrol ettikten sonra --onayla --inceledim ile çalıştırın.")
         add,upd,tot=learn(D,ted,dosya,mense)
         print(f"  ÖĞRENİLDİ: +{add} yeni, {upd} güncelleme, toplam {tot} kayıt")
         # tamamlanana taşı: CI/PL + çıktı bir arada
